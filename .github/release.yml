@@ -1,0 +1,52 @@
+# Copyright 2026 The Agent Substrate Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Categories for GitHub's automatically generated release notes, used by
+# hack/release/draft-release.sh. They follow agent-substrate/substrate's
+# labels, and also match GitHub's default bug, enhancement and documentation
+# labels. breaking-change, release-note/none and dependencies have to be
+# created in this repository before they take effect.
+#
+# GitHub places each PR in the FIRST category it matches, and the labels
+# within a category are OR'd, so Breaking Changes comes first and a breaking
+# PR is never listed elsewhere.
+changelog:
+  exclude:
+    labels:
+      - release-note/none
+      - DO NOT MERGE
+  categories:
+    - title: "⚠️ Breaking Changes"
+      labels:
+        - breaking-change
+    - title: Bug Fixes
+      labels:
+        - kind/bug
+        - bug
+    - title: Features
+      labels:
+        - kind/feature
+        - enhancement
+      exclude:
+        labels: [kind/cleanup, kind/docs, documentation, dependencies]
+    - title: Dependencies
+      labels:
+        - dependencies
+    - title: Documentation
+      labels:
+        - kind/docs
+        - documentation
+    - title: Other Changes
+      labels:
+        - "*"
