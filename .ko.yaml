@@ -13,15 +13,17 @@
 # limitations under the License.
 
 # Substrate's base image, pinned by multi-platform index digest. Set
-# KO_DEFAULTPLATFORMS to override the platforms, e.g. host-only for kind.
+# KO_DEFAULTPLATFORMS to override the platforms, e.g. host-only for kind; make
+# release-images and release-manifest ignore it.
 defaultBaseImage: gcr.io/distroless/static-debian13:latest@sha256:15f8637509792e05b97d83451b0b6ccfa4abd548f997e406ac1e72c87fe1fa78
 
 defaultPlatforms:
   - linux/amd64
   - linux/arm64
 
-# Stamps main.version with VERSION, the release tag. With VERSION unset the
-# binary reports the module version Go records from git.
+# Stamps main.version with VERSION, the release tag. ko fails if VERSION is
+# unset, so the Makefile always exports it. With VERSION empty the binary
+# reports the module version Go records from git.
 builds:
   - id: gsm-credential-provider
     main: ./cmd/gsm-credential-provider
