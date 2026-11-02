@@ -31,6 +31,9 @@ set -o errexit -o nounset -o pipefail
 }
 dir="$1"
 
+# gh release view, not gh api releases/tags/<tag> as in
+# refuse-published-release.sh: a draft has no tag ref, and gh finds it only by
+# falling back to listing releases and matching tagName.
 # An assignment, so a failed query (API error, rate limit) stops the script
 # under errexit instead of being read as "published" and skipping the upload.
 is_draft="$(gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft)"

@@ -137,13 +137,26 @@ previous="$(
     echo "${base}"
   } | sort -V | grep -B1 -xF "${base}" | grep -vxF "${base}" || true
 )"
+# Every release is above v0.0.0, so nothing below this tag means a typo in it.
+if [[ -z "${previous}" ]]; then
+  echo "error: ${REPO} has no vX.Y.Z tag below ${tag}, so there is no" \
+    "previous release to start the notes from; check the tag" >&2
+  exit 1
+fi
+# get-contributors.sh reads ${previous}..${target} from the local clone, which
+# may lack the tags even though the API has them. Check now, before any notes
+# are generated, so the error names the cause.
+for ref in "${previous}" "${target}"; do
+  if ! git rev-parse -q --verify "${ref}^{commit}" >/dev/null; then
+    echo "error: ${ref} is not in the local clone; fetch it first," \
+      "e.g. git fetch --tags https://github.com/${REPO}.git" >&2
+    exit 1
+  fi
+done
 
-generate_args=(-f "tag_name=${tag}")
+generate_args=(-f "tag_name=${tag}" -f "previous_tag_name=${previous}")
 if [[ "${target}" != "${tag}" ]]; then
   generate_args+=(-f "target_commitish=${target}")
-fi
-if [[ -n "${previous}" ]]; then
-  generate_args+=(-f "previous_tag_name=${previous}")
 fi
 if ! notes="$(api "generating notes" "repos/${REPO}/releases/generate-notes" \
   "${generate_args[@]}" --jq .body)"; then
@@ -180,24 +193,22 @@ if [[ "${REPO}" == "${UPSTREAM_REPO}" ]]; then
 fi
 
 # GitHub only lists first-time contributors; list everyone. get-contributors.sh
-# reads the range from the local clone, so both ends must be present locally
-# (the release workflow checks out full history).
-if [[ -n "${previous}" ]]; then
-  owner="${REPO%%/*}"
-  name="${REPO#*/}"
-  contributors="$(ORG="${owner}" REPO="${name}" \
-    "${ROOT}/hack/util/get-contributors.sh" "${previous}..${target}" | tail -n +2)"
-  if [[ -n "${contributors}" ]]; then
-    notes+=$'\n\n## Committers in this release\n\n'
-    notes+="${contributors}"
-  fi
+# reads the range from the local clone; both ends were checked above (the
+# release workflow checks out full history).
+owner="${REPO%%/*}"
+name="${REPO#*/}"
+contributors="$(ORG="${owner}" REPO="${name}" \
+  "${ROOT}/hack/util/get-contributors.sh" "${previous}..${target}" | tail -n +2)"
+if [[ -n "${contributors}" ]]; then
+  notes+=$'\n\n## Committers in this release\n\n'
+  notes+="${contributors}"
 fi
 
 up_to=""
 if [[ "${target}" != "${tag}" ]]; then
   up_to=", up to HEAD ${target}"
 fi
-echo "Release notes for ${tag} (previous release: ${previous:-none}${up_to}):"
+echo "Release notes for ${tag} (previous release: ${previous}${up_to}):"
 echo
 echo "${notes}"
 echo
