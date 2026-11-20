@@ -15,7 +15,8 @@
 // Package provider implements substrate's CredentialProvider API over Google
 // Cloud Secret Manager, resolving ate-secret:// URIs to a secret version's
 // payload or to one key's value in a JSON payload. Substrate never stores the
-// secret.
+// secret at rest, and the server reuses each payload it reads for its cache
+// TTL.
 package provider
 
 import (
@@ -31,8 +32,10 @@ import (
 
 	secretmanagerpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
 	"github.com/googleapis/gax-go/v2"
+	"golang.org/x/sync/singleflight"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/apimachinery/pkg/util/cache"
 
 	"go.ate.dev/substrate/api/credprovider/v1"
 )
@@ -204,13 +207,31 @@ type Server struct {
 	clients      Accessors
 	authz        *ProjectAuthorizer
 	fetchTimeout time.Duration
+
+	// cacheTTL is how long a payload is reused after its read returns. 0
+	// disables caching.
+	cacheTTL time.Duration
+	// payloads maps a secret version's resource name to its verified payload,
+	// a []byte. An entry is removed when it expires.
+	payloads *cache.Expiring
+	// flight collapses concurrent reads of one secret version into a single
+	// Secret Manager call.
+	flight singleflight.Group
 }
 
 // NewServer returns a Server that reads through clients the secrets in projects
 // authz grants (none if authz is nil). Each Secret Manager call gets at most
-// fetchTimeout, which must be positive.
-func NewServer(clients Accessors, authz *ProjectAuthorizer, fetchTimeout time.Duration) *Server {
-	return &Server{clients: clients, authz: authz, fetchTimeout: fetchTimeout}
+// fetchTimeout, which must be positive. A payload is reused for cacheTTL after
+// its read returns; 0 disables reuse, though concurrent calls for one secret
+// version still share a read.
+func NewServer(clients Accessors, authz *ProjectAuthorizer, fetchTimeout, cacheTTL time.Duration) *Server {
+	return &Server{
+		clients:      clients,
+		authz:        authz,
+		fetchTimeout: fetchTimeout,
+		cacheTTL:     cacheTTL,
+		payloads:     cache.NewExpiring(),
+	}
 }
 
 // FetchSecret resolves an ate-secret:// URI to its secret version's payload, or
@@ -234,15 +255,92 @@ func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretR
 		slog.String("actor", req.GetActorSpiffeId()),
 	)
 
-	// The gateway sets no deadline and the client retries for up to a minute;
-	// answer DeadlineExceeded before Envoy's ext_proc timeout abandons the call.
-	fetchCtx, cancel := context.WithTimeout(ctx, s.fetchTimeout)
-	defer cancel()
+	// Authorization ran above, so it covers a cached payload too.
+	data, err := s.payload(ctx, ref)
+	if err != nil {
+		return nil, err
+	}
+	if ref.Key == "" {
+		return &credprovider.FetchSecretResponse{OpaqueBytes: data}, nil
+	}
+	value, err := keyValue(ref, data)
+	if err != nil {
+		return nil, err
+	}
+	return &credprovider.FetchSecretResponse{OpaqueBytes: value}, nil
+}
+
+// payload returns the verified payload of the secret version ref names,
+// reading it from Secret Manager when there is no live cache entry. Callers
+// share the returned bytes and must not modify them.
+func (s *Server) payload(ctx context.Context, ref secretRef) ([]byte, error) {
+	// The resource name carries the project, location and version as the URI
+	// writes them, so no two secret versions share an entry or a read.
+	name := ref.resourceName()
+	if data, ok := s.cached(name); ok {
+		return data, nil
+	}
+
+	// The read outlives the caller: the leader of a flight going away must
+	// not fail the callers that joined it.
+	ch := s.flight.DoChan(name, func() (any, error) {
+		// A flight that finished between the miss above and DoChan has
+		// already stored a fresh entry.
+		if data, ok := s.cached(name); ok {
+			return data, nil
+		}
+		// The read does not carry the caller's deadline, so it gets its own:
+		// short enough to answer DeadlineExceeded, which the gateway retries,
+		// before Envoy's ext_proc timeout abandons the call.
+		readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.fetchTimeout)
+		defer cancel()
+		data, err := s.read(readCtx, ref)
+		if err != nil {
+			return nil, err
+		}
+		// The TTL starts now, not when the read began, so a payload is served
+		// for up to cacheTTL plus the time its read took.
+		if s.cacheTTL > 0 {
+			s.payloads.Set(name, data, s.cacheTTL)
+			// Expiring frees an expired entry only on a later Set, which may
+			// never come. Drop the payload when it expires instead.
+			time.AfterFunc(s.cacheTTL, func() { s.evictExpired(name) })
+		}
+		return data, nil
+	})
+	select {
+	case <-ctx.Done():
+		return nil, accessError(ref, status.FromContextError(ctx.Err()).Err())
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, res.Err
+		}
+		return res.Val.([]byte), nil
+	}
+}
+
+func (s *Server) cached(name string) ([]byte, bool) {
+	v, ok := s.payloads.Get(name)
+	data, _ := v.([]byte)
+	return data, ok
+}
+
+// evictExpired removes name's entry unless it is live. An entry stored between
+// the check and the removal is lost, which costs one extra read.
+func (s *Server) evictExpired(name string) {
+	if _, live := s.payloads.Get(name); !live {
+		s.payloads.Delete(name)
+	}
+}
+
+// read fetches the payload of the secret version ref names from Secret Manager
+// and verifies it. Its errors carry the code FetchSecret answers with.
+func (s *Server) read(ctx context.Context, ref secretRef) ([]byte, error) {
 	client, err := s.clients(ref.Location)
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "secret version %s: no Secret Manager client: %v", ref.resourceName(), err)
 	}
-	resp, err := client.AccessSecretVersion(fetchCtx, &secretmanagerpb.AccessSecretVersionRequest{Name: ref.resourceName()})
+	resp, err := client.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{Name: ref.resourceName()})
 	if err != nil {
 		return nil, accessError(ref, err)
 	}
@@ -257,14 +355,7 @@ func (s *Server) FetchSecret(ctx context.Context, req *credprovider.FetchSecretR
 			return nil, status.Errorf(codes.Unavailable, "secret version %s: payload CRC32C mismatch", ref.resourceName())
 		}
 	}
-	if ref.Key == "" {
-		return &credprovider.FetchSecretResponse{OpaqueBytes: payload.GetData()}, nil
-	}
-	value, err := keyValue(ref, payload.GetData())
-	if err != nil {
-		return nil, err
-	}
-	return &credprovider.FetchSecretResponse{OpaqueBytes: value}, nil
+	return payload.GetData(), nil
 }
 
 // authorize denies unless the policy grants project to the atespace of the

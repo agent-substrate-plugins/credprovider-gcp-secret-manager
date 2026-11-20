@@ -67,8 +67,8 @@ func TestHealthHandler(t *testing.T) {
 	}
 }
 
-// run rejects a missing flag, an unreadable file or a non-positive fetch
-// timeout before it dials anything or binds a port.
+// run rejects a missing flag, an unreadable file, a non-positive fetch timeout
+// or a negative cache TTL before it dials anything or binds a port.
 func TestRunRequiresTLSFlags(t *testing.T) {
 	const caller = "spiffe://cluster.local/ns/ate-system/sa/atenet-egress"
 	policy := filepath.Join(t.TempDir(), "project-policy.yaml")
@@ -83,6 +83,7 @@ func TestRunRequiresTLSFlags(t *testing.T) {
 		injectorIdentity string
 		policyFile       string
 		fetchTimeout     time.Duration
+		secretCacheTTL   time.Duration
 		wantErr          string
 		// wantIs, if set, must be in the error chain; wantErr alone matches any
 		// failure of the same step.
@@ -94,17 +95,21 @@ func TestRunRequiresTLSFlags(t *testing.T) {
 		{name: "no project policy", serverBundle: "/bundle.pem", clientCAFile: "/ca.pem", injectorIdentity: caller, wantErr: "--project-policy-file"},
 		{name: "project policy unreadable", serverBundle: "/bundle.pem", clientCAFile: "/ca.pem", injectorIdentity: caller, policyFile: absent, wantErr: "project policy", wantIs: fs.ErrNotExist},
 		{name: "fetch timeout not positive", serverBundle: "/bundle.pem", clientCAFile: "/ca.pem", injectorIdentity: caller, policyFile: policy, fetchTimeout: -time.Second, wantErr: "--fetch-timeout"},
+		{name: "secret cache TTL negative", serverBundle: "/bundle.pem", clientCAFile: "/ca.pem", injectorIdentity: caller, policyFile: policy, secretCacheTTL: -time.Second, wantErr: "--secret-cache-ttl"},
 		{name: "client CA unreadable", serverBundle: "/bundle.pem", clientCAFile: absent, injectorIdentity: caller, policyFile: policy, wantErr: "server credentials", wantIs: fs.ErrNotExist},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			origBundle, origCA, origIdentity, origPolicy, origTimeout := *serverBundle, *clientCAFile, *injectorIdentity, *projectPolicyFile, *fetchTimeout
+			origBundle, origCA, origIdentity, origPolicy, origTimeout, origTTL := *serverBundle, *clientCAFile, *injectorIdentity, *projectPolicyFile, *fetchTimeout, *secretCacheTTL
 			t.Cleanup(func() {
-				*serverBundle, *clientCAFile, *injectorIdentity, *projectPolicyFile, *fetchTimeout = origBundle, origCA, origIdentity, origPolicy, origTimeout
+				*serverBundle, *clientCAFile, *injectorIdentity, *projectPolicyFile, *fetchTimeout, *secretCacheTTL = origBundle, origCA, origIdentity, origPolicy, origTimeout, origTTL
 			})
 			*serverBundle, *clientCAFile, *injectorIdentity, *projectPolicyFile = tc.serverBundle, tc.clientCAFile, tc.injectorIdentity, tc.policyFile
 			if tc.fetchTimeout != 0 {
 				*fetchTimeout = tc.fetchTimeout
+			}
+			if tc.secretCacheTTL != 0 {
+				*secretCacheTTL = tc.secretCacheTTL
 			}
 
 			err := run(context.Background())

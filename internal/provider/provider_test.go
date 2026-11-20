@@ -20,7 +20,10 @@ import (
 	"fmt"
 	"hash/crc32"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	secretmanagerpb "cloud.google.com/go/secretmanager/apiv1/secretmanagerpb"
@@ -45,12 +48,29 @@ type fakeAccessor struct {
 	noCRC bool
 	// block answers only once the call's context is done.
 	block bool
-	// gotName is the last requested resource name.
+	// gate, if set, holds each call until it is closed or the call's context
+	// is done.
+	gate chan struct{}
+	// gotName is the last requested resource name. Calls may overlap, so they
+	// set it under mu; read it once they are done.
 	gotName string
+	mu      sync.Mutex
+	// calls counts the calls made.
+	calls atomic.Int32
 }
 
 func (f *fakeAccessor) AccessSecretVersion(ctx context.Context, req *secretmanagerpb.AccessSecretVersionRequest, _ ...gax.CallOption) (*secretmanagerpb.AccessSecretVersionResponse, error) {
+	f.calls.Add(1)
+	f.mu.Lock()
 	f.gotName = req.GetName()
+	f.mu.Unlock()
+	if f.gate != nil {
+		select {
+		case <-f.gate:
+		case <-ctx.Done():
+			return nil, status.FromContextError(ctx.Err()).Err()
+		}
+	}
 	if f.block {
 		<-ctx.Done()
 		return nil, status.FromContextError(ctx.Err()).Err()
@@ -430,7 +450,7 @@ func TestFetchSecret(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			srv := NewServer(only(tc.accessor), testAuthorizer(t), time.Second)
+			srv := NewServer(only(tc.accessor), testAuthorizer(t), time.Second, 0)
 			resp, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{Uri: tc.uri, ActorSpiffeId: testActor})
 			if tc.wantCode != codes.OK {
 				if status.Code(err) != tc.wantCode {
@@ -452,7 +472,7 @@ func TestFetchSecret(t *testing.T) {
 func TestFetchSecretKeyErrorDoesNotQuotePayload(t *testing.T) {
 	const name = "projects/proj-123/secrets/example-api/versions/1"
 	accessor := &fakeAccessor{byName: map[string][]byte{name: []byte(`{"token": Xs3cr3t}`)}}
-	_, err := NewServer(only(accessor), testAuthorizer(t), time.Second).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+	_, err := NewServer(only(accessor), testAuthorizer(t), time.Second, 0).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
 		Uri:           "ate-secret://secretmanager.googleapis.com/" + name + "/keys/token",
 		ActorSpiffeId: testActor,
 	})
@@ -467,7 +487,7 @@ func TestFetchSecretKeyErrorDoesNotQuotePayload(t *testing.T) {
 // A URI that fails to parse is refused before Secret Manager is dialed.
 func TestFetchSecretDoesNotDialOnBadURI(t *testing.T) {
 	accessor := &fakeAccessor{}
-	_, err := NewServer(only(accessor), testAuthorizer(t), time.Second).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+	_, err := NewServer(only(accessor), testAuthorizer(t), time.Second, 0).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
 		Uri:           "ate-secret://secretmanager.googleapis.com/nope",
 		ActorSpiffeId: testActor,
 	})
@@ -507,7 +527,7 @@ func TestFetchSecretAuthorization(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			accessor := &fakeAccessor{byName: map[string][]byte{name: []byte("s3cr3t")}}
-			resp, err := NewServer(only(accessor), tc.authz, time.Second).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{Uri: uri, ActorSpiffeId: tc.actor})
+			resp, err := NewServer(only(accessor), tc.authz, time.Second, 0).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{Uri: uri, ActorSpiffeId: tc.actor})
 			if status.Code(err) != tc.wantCode {
 				t.Fatalf("code = %v, want %v (err=%v)", status.Code(err), tc.wantCode, err)
 			}
@@ -530,7 +550,7 @@ func TestFetchSecretTimesOut(t *testing.T) {
 	const timeout = 50 * time.Millisecond
 	accessor := &fakeAccessor{block: true}
 	start := time.Now()
-	_, err := NewServer(only(accessor), testAuthorizer(t), timeout).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+	_, err := NewServer(only(accessor), testAuthorizer(t), timeout, 0).FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
 		Uri:           "ate-secret://secretmanager.googleapis.com/projects/proj-123/secrets/example-api/versions/1",
 		ActorSpiffeId: testActor,
 	})
@@ -540,6 +560,370 @@ func TestFetchSecretTimesOut(t *testing.T) {
 	if elapsed := time.Since(start); elapsed < timeout || elapsed > 10*timeout {
 		t.Errorf("FetchSecret returned after %v, want about %v", elapsed, timeout)
 	}
+}
+
+// Fetches of one secret version within the TTL share a single read, with or
+// without a key. Authorization still runs on a cached payload, a failed read is
+// not cached, and an expired entry is read again.
+func TestFetchSecretCache(t *testing.T) {
+	const name = "projects/proj-123/secrets/example-api/versions/latest"
+	const uri = "ate-secret://secretmanager.googleapis.com/" + name
+	// team-a may resolve secrets in proj-123; team-b may not.
+	authz, err := newProjectAuthorizer(projectPolicyFile{Policies: []atespaceProjectPolicy{
+		{Atespace: "team-a", AllowedProjects: []string{"proj-123"}},
+		{Atespace: "team-b", AllowedProjects: []string{"proj-456"}},
+	}})
+	if err != nil {
+		t.Fatalf("newProjectAuthorizer: %v", err)
+	}
+	const teamA = "spiffe://substrate-actor.local/actor/team-a/agent-1"
+	const teamB = "spiffe://substrate-actor.local/actor/team-b/agent-1"
+	const v1 = `{"token":"s3cr3t","user":"bob"}`
+	const v2 = `{"token":"r0tated","user":"bob"}`
+
+	type fetch struct {
+		// wait is how long to sleep before this fetch, on synctest's clock.
+		wait time.Duration
+		// store, if set, becomes the secret's payload before this fetch. Until
+		// a fetch stores one, the secret does not exist.
+		store string
+		actor string
+		// key, if set, is the JSON key to fetch instead of the whole payload.
+		key      string
+		want     string
+		wantCode codes.Code
+	}
+	tests := []struct {
+		name      string
+		ttl       time.Duration
+		fetches   []fetch
+		wantReads int32
+	}{
+		{
+			name: "keys and the whole payload share a read",
+			ttl:  time.Hour,
+			fetches: []fetch{
+				{store: v1, actor: teamA, key: "token", want: "s3cr3t"},
+				{actor: teamA, key: "user", want: "bob"},
+				{actor: teamA, want: v1},
+			},
+			wantReads: 1,
+		},
+		{
+			name: "zero ttl reads every time",
+			fetches: []fetch{
+				{store: v1, actor: teamA, key: "token", want: "s3cr3t"},
+				{actor: teamA, key: "user", want: "bob"},
+			},
+			wantReads: 2,
+		},
+		{
+			name: "cached payload still checked against the project policy",
+			ttl:  time.Hour,
+			fetches: []fetch{
+				{store: v1, actor: teamA, key: "token", want: "s3cr3t"},
+				{actor: teamB, key: "token", wantCode: codes.PermissionDenied},
+			},
+			wantReads: 1,
+		},
+		{
+			name: "failed read not cached",
+			ttl:  time.Hour,
+			fetches: []fetch{
+				{actor: teamA, key: "token", wantCode: codes.NotFound},
+				{store: v1, actor: teamA, key: "token", want: "s3cr3t"},
+			},
+			wantReads: 2,
+		},
+		{
+			name: "new payload served once the entry expires",
+			ttl:  10 * time.Second,
+			fetches: []fetch{
+				{store: v1, actor: teamA, key: "token", want: "s3cr3t"},
+				{wait: 9 * time.Second, store: v2, actor: teamA, key: "token", want: "s3cr3t"},
+				{wait: time.Second, actor: teamA, key: "token", want: "r0tated"},
+			},
+			wantReads: 2,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				accessor := &fakeAccessor{byName: map[string][]byte{}}
+				srv := NewServer(only(accessor), authz, time.Second, tc.ttl)
+				for i, f := range tc.fetches {
+					if f.store != "" {
+						accessor.byName[name] = []byte(f.store)
+					}
+					time.Sleep(f.wait)
+					fetchURI := uri
+					if f.key != "" {
+						fetchURI += "/keys/" + f.key
+					}
+					resp, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{Uri: fetchURI, ActorSpiffeId: f.actor})
+					if status.Code(err) != f.wantCode {
+						t.Fatalf("fetch %d: code = %v, want %v (err=%v)", i, status.Code(err), f.wantCode, err)
+					}
+					if got := string(resp.GetOpaqueBytes()); got != f.want {
+						t.Errorf("fetch %d = %q, want %q", i, got, f.want)
+					}
+				}
+				if reads := accessor.calls.Load(); reads != tc.wantReads {
+					t.Errorf("Secret Manager reads = %d, want %d", reads, tc.wantReads)
+				}
+			})
+		})
+	}
+}
+
+// The cache drops a payload when its entry expires, without waiting for another
+// read, and holds none while disabled.
+func TestFetchSecretCacheEvictsOnExpiry(t *testing.T) {
+	const name = "projects/proj-123/secrets/example-api/versions/1"
+	for _, tc := range []struct {
+		name string
+		ttl  time.Duration
+		// wait is how long after the fetch the cache's entries are counted.
+		wait        time.Duration
+		wantEntries int
+	}{
+		{name: "kept until the ttl passes", ttl: 10 * time.Second, wait: 10*time.Second - time.Nanosecond, wantEntries: 1},
+		{name: "dropped once the ttl passes", ttl: 10 * time.Second, wait: 10 * time.Second, wantEntries: 0},
+		{name: "none held with the cache disabled", ttl: 0, wantEntries: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				accessor := &fakeAccessor{byName: map[string][]byte{name: []byte("s3cr3t")}}
+				srv := NewServer(only(accessor), testAuthorizer(t), time.Second, tc.ttl)
+				if _, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+					Uri:           "ate-secret://secretmanager.googleapis.com/" + name,
+					ActorSpiffeId: testActor,
+				}); err != nil {
+					t.Fatalf("FetchSecret: %v", err)
+				}
+				time.Sleep(tc.wait)
+				// Let an eviction due at this instant finish.
+				synctest.Wait()
+				if entries := srv.payloads.Len(); entries != tc.wantEntries {
+					t.Errorf("cache entries %v after the fetch = %d, want %d", tc.wait, entries, tc.wantEntries)
+				}
+			})
+		})
+	}
+}
+
+// The eviction due for an entry that is already gone leaves alone the live
+// entry that replaced it.
+func TestFetchSecretCacheStaleEvictionKeepsLiveEntry(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const name = "projects/proj-123/secrets/example-api/versions/1"
+		accessor := &fakeAccessor{byName: map[string][]byte{name: []byte("s3cr3t")}}
+		srv := NewServer(only(accessor), testAuthorizer(t), time.Second, 10*time.Second)
+		fetch := func() {
+			t.Helper()
+			if _, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+				Uri:           "ate-secret://secretmanager.googleapis.com/" + name,
+				ActorSpiffeId: testActor,
+			}); err != nil {
+				t.Fatalf("FetchSecret: %v", err)
+			}
+		}
+
+		// Stored at 0s, with its eviction due at 10s.
+		fetch()
+		// Lose the entry early, as an eviction racing a store can.
+		srv.payloads.Delete(name)
+		time.Sleep(5 * time.Second)
+		// Stored at 5s, live until 15s.
+		fetch()
+		time.Sleep(5 * time.Second)
+		// Let the first entry's eviction, due at this instant, finish.
+		synctest.Wait()
+		fetch()
+		if reads := accessor.calls.Load(); reads != 2 {
+			t.Errorf("Secret Manager reads = %d, want 2: the first entry's eviction dropped the second", reads)
+		}
+	})
+}
+
+// Secrets that share an ID but differ in project, location or version are kept
+// apart, so none is served another's payload: each has its own cache entry and,
+// fetched concurrently, its own read.
+func TestFetchSecretKeyedByResourceName(t *testing.T) {
+	authz, err := newProjectAuthorizer(projectPolicyFile{Policies: []atespaceProjectPolicy{
+		{Atespace: "team-a", AllowedProjects: []string{"proj-123", "proj-456"}},
+	}})
+	if err != nil {
+		t.Fatalf("newProjectAuthorizer: %v", err)
+	}
+	names := []string{
+		"projects/proj-123/secrets/example-api/versions/1",
+		"projects/proj-123/secrets/example-api/versions/2",
+		"projects/proj-123/secrets/example-api/versions/latest",
+		"projects/proj-456/secrets/example-api/versions/1",
+		"projects/proj-123/locations/us-central1/secrets/example-api/versions/1",
+	}
+	// newServer returns a server over names and the fake behind it, which
+	// serves every location and holds its answers behind gate, if set.
+	newServer := func(ttl time.Duration, gate chan struct{}) (*Server, *fakeAccessor) {
+		accessor := &fakeAccessor{byName: map[string][]byte{}, gate: gate}
+		for _, name := range names {
+			accessor.byName[name] = []byte("payload of " + name)
+		}
+		clients := func(string) (SecretAccessor, error) { return accessor, nil }
+		return NewServer(clients, authz, time.Second, ttl), accessor
+	}
+	fetch := func(srv *Server, name string) (string, error) {
+		resp, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+			Uri:           "ate-secret://secretmanager.googleapis.com/" + name,
+			ActorSpiffeId: testActor,
+		})
+		return string(resp.GetOpaqueBytes()), err
+	}
+
+	t.Run("cache", func(t *testing.T) {
+		srv, accessor := newServer(time.Hour, nil)
+		// The second round is served from the cache.
+		for round := range 2 {
+			for _, name := range names {
+				got, err := fetch(srv, name)
+				if err != nil {
+					t.Fatalf("round %d: FetchSecret(%s): %v", round, name, err)
+				}
+				if want := "payload of " + name; got != want {
+					t.Errorf("round %d: FetchSecret(%s) = %q, want %q", round, name, got, want)
+				}
+			}
+		}
+		if reads := int(accessor.calls.Load()); reads != len(names) {
+			t.Errorf("Secret Manager reads = %d, want %d, one per secret version", reads, len(names))
+		}
+	})
+
+	t.Run("concurrent reads", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			srv, accessor := newServer(0, make(chan struct{}))
+			type result struct {
+				value string
+				err   error
+			}
+			got := make([]result, len(names))
+			var wg sync.WaitGroup
+			for i, name := range names {
+				wg.Go(func() {
+					value, err := fetch(srv, name)
+					got[i] = result{value, err}
+				})
+			}
+			// Every fetch is now parked on a read, so all the reads are in
+			// flight at once.
+			synctest.Wait()
+			close(accessor.gate)
+			wg.Wait()
+			for i, name := range names {
+				if got[i].err != nil {
+					t.Errorf("FetchSecret(%s): %v", name, got[i].err)
+					continue
+				}
+				if want := "payload of " + name; got[i].value != want {
+					t.Errorf("FetchSecret(%s) = %q, want %q", name, got[i].value, want)
+				}
+			}
+			if reads := int(accessor.calls.Load()); reads != len(names) {
+				t.Errorf("Secret Manager reads = %d, want %d, one per secret version", reads, len(names))
+			}
+		})
+	})
+}
+
+// Concurrent fetches of one secret version share a single read, even with the
+// cache disabled.
+func TestFetchSecretCollapsesConcurrentReads(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const name = "projects/proj-123/secrets/example-api/versions/1"
+		accessor := &fakeAccessor{
+			byName: map[string][]byte{name: []byte("s3cr3t")},
+			gate:   make(chan struct{}),
+		}
+		srv := NewServer(only(accessor), testAuthorizer(t), time.Second, 0)
+
+		const callers = 8
+		var wg sync.WaitGroup
+		errs := make(chan error, callers)
+		for range callers {
+			wg.Go(func() {
+				_, err := srv.FetchSecret(context.Background(), &credprovider.FetchSecretRequest{
+					Uri:           "ate-secret://secretmanager.googleapis.com/" + name,
+					ActorSpiffeId: testActor,
+				})
+				errs <- err
+			})
+		}
+		// Every caller is now parked on the flight, so none can arrive after
+		// the read completes and start its own.
+		synctest.Wait()
+		close(accessor.gate)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Errorf("FetchSecret: %v", err)
+			}
+		}
+		if reads := accessor.calls.Load(); reads != 1 {
+			t.Errorf("Secret Manager reads = %d, want 1 for %d concurrent callers", reads, callers)
+		}
+	})
+}
+
+// A caller that goes away gets an error of its own and does not fail a caller
+// sharing its read.
+func TestFetchSecretReadOutlivesItsFirstCaller(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const name = "projects/proj-123/secrets/example-api/versions/1"
+		accessor := &fakeAccessor{
+			byName: map[string][]byte{name: []byte("s3cr3t")},
+			gate:   make(chan struct{}),
+		}
+		srv := NewServer(only(accessor), testAuthorizer(t), time.Second, 0)
+		req := &credprovider.FetchSecretRequest{
+			Uri:           "ate-secret://secretmanager.googleapis.com/" + name,
+			ActorSpiffeId: testActor,
+		}
+
+		// The first caller starts the read; the second joins it.
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		firstErr := make(chan error, 1)
+		go func() {
+			_, err := srv.FetchSecret(ctx, req)
+			firstErr <- err
+		}()
+		synctest.Wait()
+		type result struct {
+			value string
+			err   error
+		}
+		second := make(chan result, 1)
+		go func() {
+			resp, err := srv.FetchSecret(context.Background(), req)
+			second <- result{string(resp.GetOpaqueBytes()), err}
+		}()
+		synctest.Wait()
+
+		cancel()
+		// Canceled is not a code the gateway retries; Unavailable is.
+		if err := <-firstErr; status.Code(err) != codes.Unavailable {
+			t.Errorf("canceled caller: code = %v, want Unavailable (err=%v)", status.Code(err), err)
+		}
+		close(accessor.gate)
+		if got := <-second; got.err != nil || got.value != "s3cr3t" {
+			t.Errorf("joined caller = %q, %v, want s3cr3t", got.value, got.err)
+		}
+		if reads := accessor.calls.Load(); reads != 1 {
+			t.Errorf("Secret Manager reads = %d, want 1", reads)
+		}
+	})
 }
 
 // Each secret is read through its location's client, by its full resource name.
@@ -557,7 +941,7 @@ func TestFetchSecretRoutesByLocation(t *testing.T) {
 		}
 		return nil, fmt.Errorf("cannot create a client for %q", location)
 	}
-	srv := NewServer(clients, testAuthorizer(t), time.Second)
+	srv := NewServer(clients, testAuthorizer(t), time.Second, 0)
 
 	for _, tc := range []struct {
 		name     string
