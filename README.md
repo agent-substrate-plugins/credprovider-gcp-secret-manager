@@ -7,7 +7,8 @@ backed by Google Cloud Secret Manager. It implements substrate's
 `CredentialProvider` gRPC API (`api/credprovider/v1`) for egress
 credential injection: given an `ate-secret://secretmanager.googleapis.com/...`
 URI, it reads the secret version from Secret Manager and returns its payload,
-so the secret stays in Secret Manager and substrate never stores it.
+so the secret stays in Secret Manager and substrate never stores it at rest.
+The provider holds a payload only in memory, to [reuse it briefly](#caching).
 
 ## Endpoint
 
@@ -83,6 +84,24 @@ and every other code with a 403:
 
 Error messages name the key but never quote the payload.
 
+## Caching
+
+The provider reuses each secret version's payload for `--secret-cache-ttl`
+(10s by default; 0 disables the cache), so a busy actor does not spend Secret
+Manager quota re-reading the same secret. Every key of one version shares a
+read, and so do concurrent fetches of a version that is not cached, even with
+the cache disabled.
+
+A change in Secret Manager can take that long, plus the time of one read (at
+most `--fetch-timeout`), to take effect: a new version behind `latest`, a
+disabled or destroyed version, a deleted secret, or access revoked from the
+provider's Google identity. The TTL starts when a read returns, and a fetch
+may share a read that began before the change, even with the cache disabled.
+The project policy is checked on every fetch, and a failed read is not cached.
+
+The cache drops a payload as soon as it expires. The provider does not scrub
+memory, though, so the bytes can stay in the process for longer.
+
 ## Security model
 
 - **Only the egress gateway may call.** The provider serves mutual TLS with a
@@ -93,11 +112,11 @@ Error messages name the key but never quote the payload.
   `ate-system`.
 - **Each atespace resolves secrets only in the projects its policy grants.**
   The provider takes the atespace from the actor SPIFFE ID the gateway sends
-  and, before calling Secret Manager, refuses with `PermissionDenied` a URI
-  whose project the `--project-policy-file` policy does not list for it. The
-  policy is default-deny, like the Kubernetes Secrets provider's namespace
-  policy. A project is matched as the URI writes it, so list
-  it by the ID or number your URIs use.
+  and, before calling Secret Manager or using a cached payload, refuses with
+  `PermissionDenied` a URI whose project the `--project-policy-file` policy
+  does not list for it. The policy is default-deny, like the Kubernetes
+  Secrets provider's namespace policy. A project is matched as the URI writes
+  it, so list it by the ID or number your URIs use.
 - **The provider's Google identity bounds the rest.** Within a granted project,
   an atespace reaches whatever that identity can read, so grant it access only
   to the secrets some atespace needs.
@@ -203,7 +222,7 @@ printf '%s' "$TOKEN" | gcloud secrets create example-api-token --project <projec
 
 Its URI is
 `ate-secret://secretmanager.googleapis.com/projects/<project>/secrets/example-api-token/versions/1`,
-or `.../versions/latest` to follow new versions.
+or `.../versions/latest` to follow new versions, subject to [caching](#caching).
 
 To keep several credentials in one secret, store a JSON object and name the key:
 
@@ -250,6 +269,7 @@ and leaves the project policy in place.
 | `--injector-identity` | required | SPIFFE ID of substrate's egress gateway, the only caller the provider accepts; `spiffe://cluster.local/ns/ate-system/sa/atenet-egress` in a default install |
 | `--project-policy-file` | required | Atespace→project policy YAML |
 | `--fetch-timeout` | `3s` | Time limit for one Secret Manager read; keep it under the gateway's 5s ext_proc message timeout |
+| `--secret-cache-ttl` | `10s` | How long a secret version's payload is reused before it is read again; `0` disables the cache |
 | `--log-level` | `info` | `debug`, `info`, `warn` or `error` |
 | `--drain-grace` | `5s` | How long in-flight calls may finish on shutdown |
 

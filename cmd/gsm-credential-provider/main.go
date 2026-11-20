@@ -56,7 +56,8 @@ var (
 	drainGrace        = flag.Duration("drain-grace", 5*time.Second, "how long to wait for in-flight RPCs on shutdown before a hard stop")
 	// Stays under the egress gateway's 5s ext_proc message timeout, after which
 	// Envoy abandons the request.
-	fetchTimeout = flag.Duration("fetch-timeout", 3*time.Second, "how long a single Secret Manager read may take; keep it under the egress gateway's ext_proc message timeout")
+	fetchTimeout   = flag.Duration("fetch-timeout", 3*time.Second, "how long a single Secret Manager read may take; keep it under the egress gateway's ext_proc message timeout")
+	secretCacheTTL = flag.Duration("secret-cache-ttl", 10*time.Second, "how long a secret version's payload is cached; a change in Secret Manager can take that long, plus one read, to show; 0 disables the cache")
 )
 
 // version is set at build time with -ldflags "-X main.version=v0.1.0".
@@ -95,6 +96,9 @@ func run(ctx context.Context) error {
 	if *fetchTimeout <= 0 {
 		return fmt.Errorf("--fetch-timeout must be positive, got %v", *fetchTimeout)
 	}
+	if *secretCacheTTL < 0 {
+		return fmt.Errorf("--secret-cache-ttl must not be negative, got %v (0 disables the cache)", *secretCacheTTL)
+	}
 	authz, err := provider.LoadProjectAuthorizer(*projectPolicyFile)
 	if err != nil {
 		return fmt.Errorf("project policy: %w", err)
@@ -129,7 +133,7 @@ func run(ctx context.Context) error {
 	defer clients.Close()
 
 	srv := grpc.NewServer(grpc.Creds(creds))
-	credprovider.RegisterCredentialProviderServer(srv, provider.NewServer(clients.For, authz, *fetchTimeout))
+	credprovider.RegisterCredentialProviderServer(srv, provider.NewServer(clients.For, authz, *fetchTimeout, *secretCacheTTL))
 
 	grpcLis, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *listenAddr)
 	if err != nil {
