@@ -31,10 +31,16 @@ the commits already on your branch, then force-push:
 git rebase --signoff upstream/main
 ```
 
-### Review our Community Guidelines
+### Code of conduct
 
-This project follows [Google's Open Source Community
-Guidelines](https://opensource.google/conduct/).
+Please read and internalize our [code of conduct](CODE_OF_CONDUCT.md). We want
+this to be a welcoming and inclusive community, and we expect everyone to
+adhere to the code of conduct at all times. If you see someone violating the
+code of conduct, please report it to the maintainers immediately. We take all
+reports seriously and will take appropriate action to address any issues.
+
+Open, direct, honest communication is encouraged, but always be respectful and
+professional.
 
 ### Follow the Agent Substrate project policies
 
